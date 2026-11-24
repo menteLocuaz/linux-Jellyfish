@@ -38,11 +38,15 @@
 static void __blkcg_rstat_flush(struct blkcg *blkcg, int cpu);
 
 /*
- * blkcg_pol_mutex protects blkcg_policy[] and policy [de]activation.
- * blkcg_pol_register_mutex nests outside of it and synchronizes entire
- * policy [un]register operations including cgroup file additions /
- * removals.  Putting cgroup file registration outside blkcg_pol_mutex
- * allows grabbing it from cgroup callbacks.
+ * Lock hierarchy (outermost to innermost):
+ *   blkcg_pol_register_mutex
+ *     -> blkcg_pol_mutex
+ *       -> q->blkcg_mutex
+ *         -> q->queue_lock (irq)
+ *           -> blkcg->lock
+ *
+ * Putting cgroup file registration outside blkcg_pol_mutex allows grabbing
+ * blkcg_pol_mutex from cgroup callbacks without AB-BA deadlocks.
  */
 static DEFINE_MUTEX(blkcg_pol_register_mutex);
 static DEFINE_MUTEX(blkcg_pol_mutex);
@@ -53,7 +57,7 @@ EXPORT_SYMBOL_GPL(blkcg_root);
 struct cgroup_subsys_state * const blkcg_root_css = &blkcg_root.css;
 EXPORT_SYMBOL_GPL(blkcg_root_css);
 
-/* number of blkcgs with a non-zero congestion_count */
+/* Number of blkcgs with a non-zero congestion_count */
 atomic_t blkcg_nr_congested __read_mostly = ATOMIC_INIT(0);
 
 static struct blkcg_policy *blkcg_policy[BLKCG_MAX_POLS];
@@ -64,25 +68,17 @@ bool blkcg_debug_stats = false;
 
 static DEFINE_RAW_SPINLOCK(blkg_stat_lock);
 
-#define BLKG_DESTROY_BATCH_SIZE  64
+#define BLKG_DESTROY_BATCH_SIZE		64
+#define BLKG_MAX_THROTTLE_NS		(250 * NSEC_PER_MSEC)
 
-/*
- * Lockless lists for tracking IO stats update
+/**
+ * init_blkcg_llists - initialize per-CPU lockless lists for IO stats
+ * @blkcg: target block cgroup
  *
- * New IO stats are stored in the percpu iostat_cpu within blkcg_gq (blkg).
- * There are multiple blkg's (one for each block device) attached to each
- * blkcg. The rstat code keeps track of which cpu has IO stats updated,
- * but it doesn't know which blkg has the updated stats. If there are many
- * block devices in a system, the cost of iterating all the blkg's to flush
- * out the IO stats can be high. To reduce such overhead, a set of percpu
- * lockless lists (lhead) per blkcg are used to track the set of recently
- * updated iostat_cpu's since the last flush. An iostat_cpu will be put
- * onto the lockless list on the update side [blk_cgroup_bio_start()] if
- * not there yet and then removed when being flushed [blkcg_rstat_flush()].
- * References to blkg are gotten and then put back in the process to
- * protect against blkg removal.
+ * Allocates and initializes per-CPU lockless list heads used to track
+ * iostat_cpu instances with pending updates since the last rstat flush.
  *
- * Return: 0 if successful or -ENOMEM if allocation fails.
+ * Return: 0 on success, -ENOMEM if per-CPU allocation fails.
  */
 static int init_blkcg_llists(struct blkcg *blkcg)
 {
@@ -127,11 +123,9 @@ static void blkg_free_workfn(struct work_struct *work)
 #endif
 
 	/*
-	 * pd_free_fn() can also be called from blkcg_deactivate_policy(),
-	 * in order to make sure pd_free_fn() is called in order, the deletion
-	 * of the list blkg->q_node is delayed to here from blkg_destroy(), and
-	 * blkcg_mutex is used to synchronize blkg_free_workfn() and
-	 * blkcg_deactivate_policy().
+	 * pd_free_fn() can also be called from blkcg_deactivate_policy().
+	 * To guarantee pd_free_fn() is invoked in order, deletion from
+	 * q->blkg_list is deferred until here, synchronized by blkcg_mutex.
 	 */
 	mutex_lock(&q->blkcg_mutex);
 	for (i = 0; i < BLKCG_MAX_POLS; i++)
@@ -168,7 +162,7 @@ static void blkg_free(struct blkcg_gq *blkg)
 
 	/*
 	 * Both ->pd_free_fn() and request queue's release handler may
-	 * sleep, so free us by scheduling one work func
+	 * sleep, so free us by scheduling one work func.
 	 */
 	INIT_WORK(&blkg->free_work, blkg_free_workfn);
 	schedule_work(&blkg->free_work);
@@ -202,8 +196,6 @@ static void blkg_release(struct percpu_ref *ref)
 	/*
 	 * Flush all the non-empty percpu lockless lists before releasing
 	 * us, given these stat belongs to us.
-	 *
-	 * blkg_stat_lock is for serializing blkg stat update
 	 */
 	for_each_possible_cpu(cpu)
 		__blkcg_rstat_flush(blkcg, cpu);
@@ -307,6 +299,48 @@ static inline struct blkcg *blkcg_parent(struct blkcg *blkcg)
 }
 
 /**
+ * blkg_alloc_pds - allocate per-policy data for a newly allocated blkg
+ * @blkg: target blkg
+ * @disk: associated gendisk
+ * @gfp_mask: allocation mask
+ *
+ * Return: 0 on success, -ENOMEM on allocation failure (rolling back any
+ * already allocated policy data).
+ */
+static int blkg_alloc_pds(struct blkcg_gq *blkg, struct gendisk *disk,
+			  gfp_t gfp_mask)
+{
+	int i;
+
+	for (i = 0; i < BLKCG_MAX_POLS; i++) {
+		struct blkcg_policy *pol = blkcg_policy[i];
+		struct blkg_policy_data *pd;
+
+		if (!blkcg_policy_enabled(disk->queue, pol))
+			continue;
+
+		pd = pol->pd_alloc_fn(disk, blkg->blkcg, gfp_mask);
+		if (!pd)
+			goto err_free;
+
+		blkg->pd[i] = pd;
+		pd->blkg = blkg;
+		pd->plid = i;
+		pd->online = false;
+	}
+	return 0;
+
+err_free:
+	while (--i >= 0) {
+		if (blkg->pd[i]) {
+			blkcg_policy[i]->pd_free_fn(blkg->pd[i]);
+			blkg->pd[i] = NULL;
+		}
+	}
+	return -ENOMEM;
+}
+
+/**
  * blkg_alloc - allocate a blkg
  * @blkcg: block cgroup the new blkg is associated with
  * @disk: gendisk the new blkg is associated with
@@ -318,9 +352,8 @@ static struct blkcg_gq *blkg_alloc(struct blkcg *blkcg, struct gendisk *disk,
 				   gfp_t gfp_mask)
 {
 	struct blkcg_gq *blkg;
-	int i, cpu;
+	int cpu;
 
-	/* alloc and init base part */
 	blkg = kzalloc_node(sizeof(*blkg), gfp_mask, disk->queue->node);
 	if (!blkg)
 		return NULL;
@@ -347,33 +380,18 @@ static struct blkcg_gq *blkg_alloc(struct blkcg *blkcg, struct gendisk *disk,
 
 	u64_stats_init(&blkg->iostat.sync);
 	for_each_possible_cpu(cpu) {
-		u64_stats_init(&per_cpu_ptr(blkg->iostat_cpu, cpu)->sync);
-		per_cpu_ptr(blkg->iostat_cpu, cpu)->blkg = blkg;
+		struct blkg_iostat_set *bis = per_cpu_ptr(blkg->iostat_cpu, cpu);
+
+		u64_stats_init(&bis->sync);
+		bis->blkg = blkg;
 	}
 
-	for (i = 0; i < BLKCG_MAX_POLS; i++) {
-		struct blkcg_policy *pol = blkcg_policy[i];
-		struct blkg_policy_data *pd;
-
-		if (!blkcg_policy_enabled(disk->queue, pol))
-			continue;
-
-		/* alloc per-policy data and attach it to blkg */
-		pd = pol->pd_alloc_fn(disk, blkcg, gfp_mask);
-		if (!pd)
-			goto out_free_pds;
-		blkg->pd[i] = pd;
-		pd->blkg = blkg;
-		pd->plid = i;
-		pd->online = false;
-	}
+	if (blkg_alloc_pds(blkg, disk, gfp_mask))
+		goto out_put_css;
 
 	return blkg;
 
-out_free_pds:
-	while (--i >= 0)
-		if (blkg->pd[i])
-			blkcg_policy[i]->pd_free_fn(blkg->pd[i]);
+out_put_css:
 	css_put(&blkcg->css);
 out_put_queue:
 	blk_put_queue(disk->queue);
@@ -466,6 +484,41 @@ err_free_blkg:
 }
 
 /**
+ * blkg_find_highest_missing_ancestor - find highest missing ancestor blkcg
+ * @blkcg: target blkcg
+ * @q: target request_queue
+ * @closest_out: output pointer set to the closest existing ancestor blkg
+ *
+ * Walks up from @blkcg toward blkcg_root to locate the highest ancestor
+ * that does not yet have a blkg associated with @q.
+ *
+ * Return: the highest missing ancestor blkcg (or @blkcg itself).
+ */
+static struct blkcg *
+blkg_find_highest_missing_ancestor(struct blkcg *blkcg, struct request_queue *q,
+				   struct blkcg_gq **closest_out)
+{
+	struct blkcg *pos = blkcg;
+	struct blkcg *parent = blkcg_parent(blkcg);
+	struct blkcg_gq *ret_blkg = q->root_blkg;
+
+	while (parent) {
+		struct blkcg_gq *blkg = blkg_lookup(parent, q);
+
+		if (blkg) {
+			ret_blkg = blkg;
+			break;
+		}
+		pos = parent;
+		parent = blkcg_parent(parent);
+	}
+
+	if (closest_out)
+		*closest_out = ret_blkg;
+	return pos;
+}
+
+/**
  * blkg_lookup_create - lookup blkg, try to create one if not there
  * @blkcg: blkcg of interest
  * @disk: gendisk of interest
@@ -479,7 +532,7 @@ err_free_blkg:
  * down from root.
  */
 static struct blkcg_gq *blkg_lookup_create(struct blkcg *blkcg,
-		struct gendisk *disk)
+					   struct gendisk *disk)
 {
 	struct request_queue *q = disk->queue;
 	struct blkcg_gq *blkg;
@@ -501,21 +554,10 @@ static struct blkcg_gq *blkg_lookup_create(struct blkcg *blkcg,
 	 * blkg to the intended blkg should blkg_create() fail.
 	 */
 	while (true) {
-		struct blkcg *pos = blkcg;
-		struct blkcg *parent = blkcg_parent(blkcg);
-		struct blkcg_gq *ret_blkg = q->root_blkg;
+		struct blkcg_gq *ret_blkg;
+		struct blkcg *pos;
 
-		while (parent) {
-			blkg = blkg_lookup(parent, q);
-			if (blkg) {
-				/* remember closest blkg */
-				ret_blkg = blkg;
-				break;
-			}
-			pos = parent;
-			parent = blkcg_parent(parent);
-		}
-
+		pos = blkg_find_highest_missing_ancestor(blkcg, q, &ret_blkg);
 		blkg = blkg_create(pos, disk, NULL);
 		if (IS_ERR(blkg)) {
 			blkg = ret_blkg;
@@ -596,8 +638,8 @@ restart:
 		spin_unlock(&blkcg->lock);
 
 		/*
-		 * in order to avoid holding the spin lock for too long, release
-		 * it when a batch of blkgs are destroyed.
+		 * Avoid holding the spin lock for too long by releasing it
+		 * when a batch of blkgs has been destroyed.
 		 */
 		if (!(--count)) {
 			count = BLKG_DESTROY_BATCH_SIZE;
@@ -611,7 +653,7 @@ restart:
 	/*
 	 * Mark policy deactivated since policy offline has been done, and
 	 * the free is scheduled, so future blkcg_deactivate_policy() can
-	 * be bypassed
+	 * be bypassed.
 	 */
 	for (i = 0; i < BLKCG_MAX_POLS; i++) {
 		struct blkcg_policy *pol = blkcg_policy[i];
@@ -874,15 +916,10 @@ int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
 	 * non-root blkgs have access to their parents.
 	 */
 	while (true) {
-		struct blkcg *pos = blkcg;
-		struct blkcg *parent;
 		struct blkcg_gq *new_blkg;
+		struct blkcg *pos;
 
-		parent = blkcg_parent(blkcg);
-		while (parent && !blkg_lookup(parent, q)) {
-			pos = parent;
-			parent = blkcg_parent(parent);
-		}
+		pos = blkg_find_highest_missing_ancestor(blkcg, q, NULL);
 
 		/*
 		 * Drop the spinlock to allocate the new blkg. rq_qos_mutex and
@@ -1131,7 +1168,7 @@ static void blkcg_fill_root_iostats(void)
 				cpu_dkstats->ios[STAT_WRITE];
 			tmp.ios[BLKG_IOSTAT_DISCARD] +=
 				cpu_dkstats->ios[STAT_DISCARD];
-			// convert sectors to bytes
+			/* convert sectors to bytes */
 			tmp.bytes[BLKG_IOSTAT_READ] +=
 				(u64)cpu_dkstats->sectors[STAT_READ] << 9;
 			tmp.bytes[BLKG_IOSTAT_WRITE] +=
@@ -1418,7 +1455,7 @@ blkcg_css_alloc(struct cgroup_subsys_state *parent_css)
 	if (init_blkcg_llists(blkcg))
 		goto free_blkcg;
 
-	for (i = 0; i < BLKCG_MAX_POLS ; i++) {
+	for (i = 0; i < BLKCG_MAX_POLS; i++) {
 		struct blkcg_policy *pol = blkcg_policy[i];
 		struct blkcg_policy_data *cpd;
 
@@ -1758,6 +1795,26 @@ static void blkcg_free_all_cpd(struct blkcg_policy *pol)
 }
 
 /**
+ * blkcg_policy_validate_ops - validate policy allocation/free callbacks
+ * @pol: policy to inspect
+ *
+ * Allocation and free callbacks for both per-cgroup (cpd) and per-blkg (pd)
+ * data must be supplied in matching pairs.
+ *
+ * Return: true if valid, false otherwise.
+ */
+static bool blkcg_policy_validate_ops(const struct blkcg_policy *pol)
+{
+	if (!pol)
+		return false;
+	if (!pol->cpd_alloc_fn ^ !pol->cpd_free_fn)
+		return false;
+	if (!pol->pd_alloc_fn ^ !pol->pd_free_fn)
+		return false;
+	return true;
+}
+
+/**
  * blkcg_policy_register - register a blkcg policy
  * @pol: blkcg policy to register
  *
@@ -1769,12 +1826,7 @@ int blkcg_policy_register(struct blkcg_policy *pol)
 	struct blkcg *blkcg;
 	int i, ret;
 
-	/*
-	 * Make sure cpd/pd_alloc_fn and cpd/pd_free_fn in pairs, and policy
-	 * without pd_alloc_fn/pd_free_fn can't be activated.
-	 */
-	if ((!pol->cpd_alloc_fn ^ !pol->cpd_free_fn) ||
-	    (!pol->pd_alloc_fn ^ !pol->pd_free_fn))
+	if (!blkcg_policy_validate_ops(pol))
 		return -EINVAL;
 
 	mutex_lock(&blkcg_pol_register_mutex);
@@ -1937,7 +1989,7 @@ static void blkcg_scale_delay(struct blkcg_gq *blkg, u64 now)
 static void blkcg_maybe_throttle_blkg(struct blkcg_gq *blkg, bool use_memdelay)
 {
 	unsigned long pflags;
-	bool clamp;
+	bool clamp = false;
 	u64 now = blk_time_get_ns();
 	u64 exp;
 	u64 delay_nsec = 0;
@@ -1972,7 +2024,7 @@ static void blkcg_maybe_throttle_blkg(struct blkcg_gq *blkg, bool use_memdelay)
 	 * caller is responsible for regulating the range.
 	 */
 	if (clamp)
-		delay_nsec = min_t(u64, delay_nsec, 250 * NSEC_PER_MSEC);
+		delay_nsec = min_t(u64, delay_nsec, BLKG_MAX_THROTTLE_NS);
 
 	if (use_memdelay)
 		psi_memstall_enter(&pflags);
@@ -2099,17 +2151,18 @@ retry:
 
 	return NULL;
 }
+
 /**
- * blkg_tryget_closest - try and get a blkg ref on the closet blkg
+ * blkg_tryget_closest - try and get a blkg ref on the closest blkg
  * @bio: target bio
  * @css: target css
  *
- * As the failure mode here is to walk up the blkg tree, this ensure that the
+ * As the failure mode here is to walk up the blkg tree, this ensures that the
  * blkg->parent pointers are always valid.  This returns the blkg that it ended
  * up taking a reference on or %NULL if no reference was taken.
  */
 static inline struct blkcg_gq *blkg_tryget_closest(struct bio *bio,
-		struct cgroup_subsys_state *css)
+						   struct cgroup_subsys_state *css)
 {
 	struct request_queue *q = bio->bi_bdev->bd_queue;
 	struct blkcg *blkcg = css_to_blkcg(css);
